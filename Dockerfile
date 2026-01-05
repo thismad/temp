@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies
 COPY pyproject.toml .
-RUN pip install --no-cache-dir fastapi uvicorn websockets
+RUN pip install --no-cache-dir fastapi uvicorn websockets orjson
 
 # Copy application files
 COPY server.py .

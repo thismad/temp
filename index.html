@@ -150,6 +150,11 @@
             ws.onopen = () => console.log('Connected!');
             ws.onmessage = e => {
                 const msg = JSON.parse(e.data);
+                if (msg.t === 'full') {
+                    alert(msg.msg || 'Server is full');
+                    startScreen.classList.remove('hidden');
+                    return;
+                }
                 if (msg.t === 'welcome') {
                     myId = msg.id;
                     mapSize = msg.map;
@@ -166,6 +171,7 @@
                     cactus = (msg.c || []).map(c => ({ x: c[0], y: c[1], size: c[2] }));
                     ejected = (msg.e || []).map(e => ({ x: e[0], y: e[1], size: e[2], color: e[3] }));
                     leaderboardData = msg.l;
+                    mapSize = msg.map;  // Update map size (can change dynamically)
                     updateLeaderboard();
                 }
             };
