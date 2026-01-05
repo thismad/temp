@@ -1,7 +1,7 @@
 """
 Micro Agar.io Clone - Server
 ~50 players, lightweight, real-time
-OPTIMIZED: spatial hashing, dist², cached leaderboard, parallel broadcast, orjson
+OPTIMIZED v2: spatial grid for all collisions, cached state data, static cactus grid
 """
 
 import asyncio
@@ -13,7 +13,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-# Fast JSON (orjson is ~3-10x faster)
 try:
     import orjson
     def json_dumps(obj): return orjson.dumps(obj).decode()
@@ -36,7 +35,7 @@ PLAYERS_PER_SCALE = 10
 CACTUS_SIZE = 15
 PLAYER_START_SIZE = 30
 TICK_RATE = 20
-SPEED_BASE = 5
+SPEED_BASE = 7
 SIZE_SPEED_FACTOR = 0.02
 EJECT_SIZE = 12
 EJECT_SPEED = 15
@@ -44,11 +43,10 @@ EJECT_COST = 15
 SPLIT_MIN_SIZE = 35
 MERGE_TIME = 200
 MAX_CELLS = 16
-GRID_CELL_SIZE = 100
+GRID_CELL_SIZE = 150  # Larger cells = fewer buckets to check
 
 
 class SpatialGrid:
-    """Spatial hashing for O(1) neighbor lookups instead of O(n²)"""
     __slots__ = ('cell_size', 'grid')
 
     def __init__(self, cell_size: int = GRID_CELL_SIZE):
@@ -66,9 +64,23 @@ class SpatialGrid:
         results = []
         cells_needed = int(radius // self.cell_size) + 1
         cx, cy = int(x // self.cell_size), int(y // self.cell_size)
+        grid = self.grid
         for dx in range(-cells_needed, cells_needed + 1):
             for dy in range(-cells_needed, cells_needed + 1):
-                bucket = self.grid.get((cx + dx, cy + dy))
+                bucket = grid.get((cx + dx, cy + dy))
+                if bucket:
+                    results.extend(bucket)
+        return results
+
+    def query_rect(self, x: float, y: float, half_w: float, half_h: float) -> list:
+        """Query a rectangular area - more efficient for viewport culling"""
+        results = []
+        x1, y1 = int((x - half_w) // self.cell_size), int((y - half_h) // self.cell_size)
+        x2, y2 = int((x + half_w) // self.cell_size), int((y + half_h) // self.cell_size)
+        grid = self.grid
+        for gx in range(x1, x2 + 1):
+            for gy in range(y1, y2 + 1):
+                bucket = grid.get((gx, gy))
                 if bucket:
                     results.extend(bucket)
         return results
@@ -153,11 +165,13 @@ class Cell:
 
         if dist_sq > 25:
             dist = math.sqrt(dist_sq)
-            self.x += (dx / dist) * self.speed
-            self.y += (dy / dist) * self.speed
+            spd = self.speed
+            self.x += (dx / dist) * spd
+            self.y += (dy / dist) * spd
 
-        self.x = max(self.radius, min(self.map_w - self.radius, self.x))
-        self.y = max(self.radius, min(self.map_h - self.radius, self.y))
+        r = self.size
+        self.x = max(r, min(self.map_w - r, self.x))
+        self.y = max(r, min(self.map_h - r, self.y))
 
         if self.merge_time > 0:
             self.merge_time -= 1
@@ -191,19 +205,17 @@ class Player:
     def total_size(self):
         return sum(c.size for c in self.cells)
 
-    @property
-    def center_x(self):
+    def get_center(self):
+        """Return (center_x, center_y, total_size) in one pass"""
         if not self.cells:
-            return self.map_w / 2
-        total = self.total_size
-        return sum(c.x * c.size for c in self.cells) / total
-
-    @property
-    def center_y(self):
-        if not self.cells:
-            return self.map_h / 2
-        total = self.total_size
-        return sum(c.y * c.size for c in self.cells) / total
+            return self.map_w / 2, self.map_h / 2, 0
+        total = 0
+        wx = wy = 0
+        for c in self.cells:
+            total += c.size
+            wx += c.x * c.size
+            wy += c.y * c.size
+        return wx / total, wy / total, total
 
     def respawn(self, map_w: int = None, map_h: int = None):
         w = map_w or self.map_w
@@ -230,12 +242,16 @@ class Game:
         self.map_height = BASE_MAP_HEIGHT
         self.scale_level = 0
 
+        # Spatial grids
         self.food_grid = SpatialGrid()
         self.cell_grid = SpatialGrid()
         self.ejected_grid = SpatialGrid()
         self.cactus_grid = SpatialGrid()
+        self._cactus_grid_dirty = True  # Only rebuild when cactus added
 
+        # Cached data (updated once per tick)
         self._cached_leaderboard = []
+        self._cached_cells_data = []
 
         for _ in range(FOOD_COUNT):
             self.food.append(Food(map_w=self.map_width, map_h=self.map_height))
@@ -244,7 +260,8 @@ class Game:
         for i in range(num_bots):
             self.add_bot(BOT_NAMES[i % len(BOT_NAMES)])
 
-    def _rebuild_grids(self):
+    def _rebuild_dynamic_grids(self):
+        """Rebuild only grids that change every tick"""
         self.food_grid.clear()
         for i, f in enumerate(self.food):
             self.food_grid.insert((i, f), f.x, f.y)
@@ -258,16 +275,31 @@ class Game:
         for i, e in enumerate(self.ejected):
             self.ejected_grid.insert((i, e), e.x, e.y)
 
-        self.cactus_grid.clear()
-        for cactus in self.cactus:
-            self.cactus_grid.insert(cactus, cactus.x, cactus.y)
+        # Cactus grid only rebuilt when dirty (new cactus added)
+        if self._cactus_grid_dirty:
+            self.cactus_grid.clear()
+            for cactus in self.cactus:
+                self.cactus_grid.insert(cactus, cactus.x, cactus.y)
+            self._cactus_grid_dirty = False
 
-    def _update_leaderboard(self):
+    def _update_cached_data(self):
+        """Update all cached data once per tick"""
+        players = self.players.values()
+
+        # Leaderboard (all players)
         self._cached_leaderboard = sorted(
-            [(p.name, p.score) for p in self.players.values()],
+            [(p.name, p.score) for p in players],
             key=lambda x: x[1],
             reverse=True
-        )[:10]
+        )
+
+        # All cells data (for all players to see)
+        cells = []
+        for p in players:
+            pid, name, color = p.id, p.name, p.color
+            for cell in p.cells:
+                cells.append([pid, round(cell.x), round(cell.y), round(cell.size), name, color])
+        self._cached_cells_data = cells
 
     def player_count(self):
         return sum(1 for p in self.players.values() if not p.is_bot)
@@ -288,6 +320,7 @@ class Game:
                 self.food.append(Food(map_w=self.map_width, map_h=self.map_height))
             for _ in range(max(0, new_cactus)):
                 self.cactus.append(Cactus(map_w=self.map_width, map_h=self.map_height))
+                self._cactus_grid_dirty = True
 
     def add_player(self, ws: WebSocket, name: str) -> Player | None:
         if self.player_count() >= MAX_PLAYERS:
@@ -306,10 +339,10 @@ class Game:
         return bot
 
     def remove_player(self, player_id: int):
-        if player_id in self.players:
-            del self.players[player_id]
+        self.players.pop(player_id, None)
 
     def feed(self, player: Player):
+        mw, mh = self.map_width, self.map_height
         for cell in player.cells:
             if cell.size < EJECT_COST + EJECT_SIZE:
                 continue
@@ -324,17 +357,17 @@ class Game:
             dx /= dist
             dy /= dist
 
-            eject_x = cell.x + dx * (cell.radius + EJECT_SIZE)
-            eject_y = cell.y + dy * (cell.radius + EJECT_SIZE)
-
             self.ejected.append(EjectedMass(
-                eject_x, eject_y, dx * EJECT_SPEED, dy * EJECT_SPEED,
-                player.color, map_w=self.map_width, map_h=self.map_height
+                cell.x + dx * (cell.size + EJECT_SIZE),
+                cell.y + dy * (cell.size + EJECT_SIZE),
+                dx * EJECT_SPEED, dy * EJECT_SPEED,
+                player.color, map_w=mw, map_h=mh
             ))
             cell.size = math.sqrt(cell.size**2 - EJECT_SIZE**2)
 
     def split(self, player: Player):
         new_cells = []
+        mw, mh = self.map_width, self.map_height
         for cell in player.cells:
             if len(player.cells) + len(new_cells) >= MAX_CELLS:
                 break
@@ -351,15 +384,15 @@ class Game:
                 dx /= dist
                 dy /= dist
 
-            new_size = cell.size / 1.4142135623730951
+            new_size = cell.size * 0.7071067811865476  # 1/sqrt(2)
             cell.size = new_size
             cell.merge_time = MERGE_TIME
 
             new_cell = Cell(
-                cell.x + dx * cell.radius,
-                cell.y + dy * cell.radius,
+                cell.x + dx * cell.size,
+                cell.y + dy * cell.size,
                 new_size, dx * 20, dy * 20,
-                map_w=self.map_width, map_h=self.map_height
+                map_w=mw, map_h=mh
             )
             new_cell.merge_time = MERGE_TIME
             new_cells.append(new_cell)
@@ -372,264 +405,263 @@ class Game:
                 continue
 
             main_cell = max(player.cells, key=lambda c: c.size)
+            mx, my, ms = main_cell.x, main_cell.y, main_cell.size
 
-            nearby_food = self.food_grid.query(main_cell.x, main_cell.y, 500)
-            nearest_food = None
-            nearest_dist_sq = float('inf')
-            for _, f in nearby_food:
-                dx = f.x - main_cell.x
-                dy = f.y - main_cell.y
-                dist_sq = dx * dx + dy * dy
-                if dist_sq < nearest_dist_sq:
-                    nearest_dist_sq = dist_sq
-                    nearest_food = f
-
-            flee_target = None
-            nearby_cells = self.cell_grid.query(main_cell.x, main_cell.y, 200)
+            # Combined query for threats and prey (300 radius covers both)
+            nearby_cells = self.cell_grid.query(mx, my, 300)
+            
+            flee_target = chase_target = None
             for other_player, oc in nearby_cells:
                 if other_player.id == player.id:
                     continue
-                dx = oc.x - main_cell.x
-                dy = oc.y - main_cell.y
+                dx = oc.x - mx
+                dy = oc.y - my
                 dist_sq = dx * dx + dy * dy
-                if oc.size > main_cell.size * 1.1 and dist_sq < 40000:
-                    flee_target = (main_cell.x - dx, main_cell.y - dy)
-                    break
-
-            chase_target = None
-            if not flee_target:
-                nearby_cells = self.cell_grid.query(main_cell.x, main_cell.y, 300)
-                for other_player, oc in nearby_cells:
-                    if other_player.id == player.id:
-                        continue
-                    dx = oc.x - main_cell.x
-                    dy = oc.y - main_cell.y
-                    dist_sq = dx * dx + dy * dy
-                    if main_cell.size > oc.size * 1.1 and dist_sq < 90000:
-                        chase_target = (oc.x, oc.y)
-                        break
+                
+                # Threat detection (flee)
+                if not flee_target and oc.size > ms * 1.1 and dist_sq < 40000:
+                    flee_target = (mx - dx, my - dy)
+                # Prey detection (chase)
+                elif not chase_target and ms > oc.size * 1.1 and dist_sq < 90000:
+                    chase_target = (oc.x, oc.y)
 
             if flee_target:
                 player.target_x, player.target_y = flee_target
             elif chase_target:
                 player.target_x, player.target_y = chase_target
-            elif nearest_food:
-                player.target_x = nearest_food.x
-                player.target_y = nearest_food.y
+            else:
+                # Find nearest food
+                nearby_food = self.food_grid.query(mx, my, 400)
+                if nearby_food:
+                    nearest = min(nearby_food, key=lambda f: (f[1].x - mx)**2 + (f[1].y - my)**2)
+                    player.target_x, player.target_y = nearest[1].x, nearest[1].y
 
     def merge_cells(self, player: Player):
-        if len(player.cells) < 2:
+        cells = player.cells
+        if len(cells) < 2:
             return
 
         merged = set()
-        for i, c1 in enumerate(player.cells):
+        for i in range(len(cells)):
             if i in merged:
                 continue
-            for j, c2 in enumerate(player.cells[i+1:], i+1):
-                if j in merged or c1.merge_time > 0 or c2.merge_time > 0:
+            c1 = cells[i]
+            if c1.merge_time > 0:
+                continue
+            for j in range(i + 1, len(cells)):
+                if j in merged:
+                    continue
+                c2 = cells[j]
+                if c2.merge_time > 0:
                     continue
 
                 dx = c1.x - c2.x
                 dy = c1.y - c2.y
                 dist_sq = dx * dx + dy * dy
-                threshold = max(c1.radius, c2.radius) * 0.8
-                threshold_sq = threshold * threshold
+                threshold = max(c1.size, c2.size) * 0.8
 
-                if dist_sq < threshold_sq:
+                if dist_sq < threshold * threshold:
                     c1.size = math.sqrt(c1.size**2 + c2.size**2)
                     total = c1.size + c2.size
                     c1.x = (c1.x * c1.size + c2.x * c2.size) / total
                     c1.y = (c1.y * c1.size + c2.y * c2.size) / total
                     merged.add(j)
 
-        player.cells = [c for i, c in enumerate(player.cells) if i not in merged]
+        if merged:
+            player.cells = [c for i, c in enumerate(cells) if i not in merged]
 
     def push_apart_cells(self, player: Player):
-        for i, c1 in enumerate(player.cells):
-            for c2 in player.cells[i+1:]:
+        cells = player.cells
+        n = len(cells)
+        for i in range(n):
+            c1 = cells[i]
+            for j in range(i + 1, n):
+                c2 = cells[j]
                 dx = c1.x - c2.x
                 dy = c1.y - c2.y
                 dist_sq = dx * dx + dy * dy
-                min_dist = c1.radius + c2.radius
-                min_dist_sq = min_dist * min_dist
+                min_dist = c1.size + c2.size
 
-                if dist_sq < min_dist_sq and dist_sq > 0:
+                if dist_sq < min_dist * min_dist and dist_sq > 0:
                     dist = math.sqrt(dist_sq)
-                    overlap = (min_dist - dist) / 2
+                    overlap = (min_dist - dist) * 0.25
                     dx /= dist
                     dy /= dist
-                    c1.x += dx * overlap * 0.5
-                    c1.y += dy * overlap * 0.5
-                    c2.x -= dx * overlap * 0.5
-                    c2.y -= dy * overlap * 0.5
+                    c1.x += dx * overlap
+                    c1.y += dy * overlap
+                    c2.x -= dx * overlap
+                    c2.y -= dy * overlap
 
     def update(self):
-        self._rebuild_grids()
+        self._rebuild_dynamic_grids()
         self.update_bots()
 
+        # Move and process player cells
         for player in self.players.values():
+            tx, ty = player.target_x, player.target_y
             for cell in player.cells:
-                cell.move_towards(player.target_x, player.target_y)
+                cell.move_towards(tx, ty)
             self.push_apart_cells(player)
             self.merge_cells(player)
 
+        # Update ejected masses
         for e in self.ejected:
             e.update()
 
+        # Food collisions (spatial grid)
+        mw, mh = self.map_width, self.map_height
         for player in self.players.values():
             for cell in player.cells:
-                nearby = self.food_grid.query(cell.x, cell.y, cell.radius + FOOD_SIZE)
-                eaten_indices = []
+                r_sq = cell.size * cell.size
+                nearby = self.food_grid.query(cell.x, cell.y, cell.size + FOOD_SIZE)
+                eaten = []
                 for idx, f in nearby:
                     dx = cell.x - f.x
                     dy = cell.y - f.y
-                    dist_sq = dx * dx + dy * dy
-                    if dist_sq < cell.radius * cell.radius:
-                        eaten_indices.append(idx)
+                    if dx * dx + dy * dy < r_sq:
+                        eaten.append(idx)
                         cell.size = math.sqrt(cell.size**2 + f.size**2 * 0.5)
                         player.score += int(f.size)
+                for idx in eaten:
+                    self.food[idx] = Food(map_w=mw, map_h=mh)
 
-                for idx in eaten_indices:
-                    self.food[idx] = Food(map_w=self.map_width, map_h=self.map_height)
-
+        # Ejected mass collisions
         eaten_ejected = set()
         for player in self.players.values():
             for cell in player.cells:
-                nearby = self.ejected_grid.query(cell.x, cell.y, cell.radius + EJECT_SIZE)
+                r_sq = cell.size * cell.size
+                nearby = self.ejected_grid.query(cell.x, cell.y, cell.size + EJECT_SIZE)
                 for idx, e in nearby:
                     if idx in eaten_ejected or e.lifetime < 10:
                         continue
                     dx = cell.x - e.x
                     dy = cell.y - e.y
-                    dist_sq = dx * dx + dy * dy
-                    if dist_sq < cell.radius * cell.radius:
+                    if dx * dx + dy * dy < r_sq:
                         cell.size = math.sqrt(cell.size**2 + e.size**2 * 0.5)
                         player.score += int(e.size)
                         eaten_ejected.add(idx)
 
-        for idx in sorted(eaten_ejected, reverse=True):
-            self.ejected.pop(idx)
+        if eaten_ejected:
+            self.ejected = [e for i, e in enumerate(self.ejected) if i not in eaten_ejected]
 
+        # Cactus collisions
         for player in self.players.values():
             for cell in player.cells:
-                nearby = self.cactus_grid.query(cell.x, cell.y, cell.radius + CACTUS_SIZE)
+                nearby = self.cactus_grid.query(cell.x, cell.y, cell.size + CACTUS_SIZE)
                 for cactus in nearby:
                     dx = cell.x - cactus.x
                     dy = cell.y - cactus.y
-                    dist_sq = dx * dx + dy * dy
-                    threshold = cell.radius + cactus.size
-                    if dist_sq < threshold * threshold:
+                    threshold = cell.size + cactus.size
+                    if dx * dx + dy * dy < threshold * threshold:
                         if cell.size > PLAYER_START_SIZE * 1.5:
                             pieces = min(5, int(cell.size / 20))
                             for _ in range(pieces):
-                                angle = random.uniform(0, 6.283185307179586)
-                                vx = math.cos(angle) * EJECT_SPEED * 1.5
-                                vy = math.sin(angle) * EJECT_SPEED * 1.5
+                                angle = random.random() * 6.283185307179586
                                 self.ejected.append(EjectedMass(
-                                    cell.x, cell.y, vx, vy, player.color, EJECT_SIZE,
-                                    map_w=self.map_width, map_h=self.map_height
+                                    cell.x, cell.y,
+                                    math.cos(angle) * EJECT_SPEED * 1.5,
+                                    math.sin(angle) * EJECT_SPEED * 1.5,
+                                    player.color, EJECT_SIZE, mw, mh
                                 ))
                                 cell.size = math.sqrt(max(PLAYER_START_SIZE**2, cell.size**2 - EJECT_SIZE**2))
 
-        players_list = list(self.players.values())
-        for p1 in players_list:
-            for p2 in players_list:
-                if p1.id >= p2.id:
+        # Player vs Player collisions - track cells to remove
+        cells_to_remove = {}  # player_id -> set of cell indices
+        for player in self.players.values():
+            for i, cell in enumerate(player.cells):
+                if cells_to_remove.get(player.id) and i in cells_to_remove[player.id]:
                     continue
+                nearby = self.cell_grid.query(cell.x, cell.y, cell.size * 2)
+                for other_player, other_cell in nearby:
+                    if other_player.id == player.id:
+                        continue
+                    try:
+                        j = other_player.cells.index(other_cell)
+                    except ValueError:
+                        continue
+                    if cells_to_remove.get(other_player.id) and j in cells_to_remove[other_player.id]:
+                        continue
 
-                cells_to_remove_p1 = set()
-                cells_to_remove_p2 = set()
+                    dx = cell.x - other_cell.x
+                    dy = cell.y - other_cell.y
+                    dist_sq = dx * dx + dy * dy
+                    threshold = max(cell.size, other_cell.size)
 
-                for i, c1 in enumerate(p1.cells):
-                    for j, c2 in enumerate(p2.cells):
-                        dx = c1.x - c2.x
-                        dy = c1.y - c2.y
-                        dist_sq = dx * dx + dy * dy
-                        threshold = max(c1.radius, c2.radius)
+                    if dist_sq < threshold * threshold:
+                        if cell.size > other_cell.size * 1.1:
+                            cell.size = math.sqrt(cell.size**2 + other_cell.size**2 * 0.5)
+                            player.score += int(other_cell.size)
+                            if other_player.id not in cells_to_remove:
+                                cells_to_remove[other_player.id] = set()
+                            cells_to_remove[other_player.id].add(j)
+                        elif other_cell.size > cell.size * 1.1:
+                            other_cell.size = math.sqrt(other_cell.size**2 + cell.size**2 * 0.5)
+                            other_player.score += int(cell.size)
+                            if player.id not in cells_to_remove:
+                                cells_to_remove[player.id] = set()
+                            cells_to_remove[player.id].add(i)
+                            break
 
-                        if dist_sq < threshold * threshold:
-                            if c1.size > c2.size * 1.1:
-                                c1.size = math.sqrt(c1.size**2 + c2.size**2 * 0.5)
-                                p1.score += int(c2.size)
-                                cells_to_remove_p2.add(j)
-                            elif c2.size > c1.size * 1.1:
-                                c2.size = math.sqrt(c2.size**2 + c1.size**2 * 0.5)
-                                p2.score += int(c1.size)
-                                cells_to_remove_p1.add(i)
+        # Remove eaten cells
+        for pid, indices in cells_to_remove.items():
+            if pid in self.players:
+                self.players[pid].cells = [c for i, c in enumerate(self.players[pid].cells) if i not in indices]
 
-                p1.cells = [c for i, c in enumerate(p1.cells) if i not in cells_to_remove_p1]
-                p2.cells = [c for i, c in enumerate(p2.cells) if i not in cells_to_remove_p2]
-
+        # Respawn players with no cells
         for player in self.players.values():
             if not player.cells:
-                player.respawn(self.map_width, self.map_height)
+                player.respawn(mw, mh)
 
-        self._update_leaderboard()
+        # Update cached data
+        self._update_cached_data()
 
     def get_state(self, for_player_id: int) -> dict:
         player = self.players.get(for_player_id)
         if not player:
             return {}
 
-        view_size = 800 + player.total_size * 2
-        px, py = player.center_x, player.center_y
+        px, py, total_size = player.get_center()
+        view_size = 1600 + total_size * 4
 
-        cells_data = []
-        for p in self.players.values():
-            for cell in p.cells:
-                cells_data.append([
-                    p.id, round(cell.x), round(cell.y), round(cell.size), p.name, p.color
-                ])
-
+        # Use spatial grid for viewport culling
         food_data = [
             [round(f.x), round(f.y), f.color]
-            for f in self.food
-            if abs(f.x - px) < view_size and abs(f.y - py) < view_size
+            for _, f in self.food_grid.query_rect(px, py, view_size, view_size)
         ]
 
         cactus_data = [
             [round(c.x), round(c.y), c.size]
-            for c in self.cactus
-            if abs(c.x - px) < view_size and abs(c.y - py) < view_size
+            for c in self.cactus_grid.query_rect(px, py, view_size, view_size)
         ]
 
         ejected_data = [
             [round(e.x), round(e.y), round(e.size), e.color]
-            for e in self.ejected
-            if abs(e.x - px) < view_size and abs(e.y - py) < view_size
-        ]
-
-        # All connected players list (name, total_size, cell_count, is_bot)
-        all_players = [
-            [p.name, round(p.total_size), len(p.cells), p.is_bot]
-            for p in self.players.values()
+            for _, e in self.ejected_grid.query_rect(px, py, view_size, view_size)
         ]
 
         return {
             "t": "s",
-            "p": cells_data,
+            "p": self._cached_cells_data,
             "f": food_data,
             "c": cactus_data,
             "e": ejected_data,
             "l": self._cached_leaderboard,
-            "a": all_players,  # All players list
             "you": for_player_id,
             "map": [self.map_width, self.map_height]
         }
 
     async def _send_state(self, pid: int, player: Player) -> int | None:
         try:
-            state = self.get_state(pid)
-            await player.ws.send_text(json_dumps(state))
+            await player.ws.send_text(json_dumps(self.get_state(pid)))
             return None
         except:
             return pid
 
     async def broadcast(self):
-        players_snapshot = [(pid, p) for pid, p in self.players.items() if not p.is_bot]
-        tasks = [self._send_state(pid, player) for pid, player in players_snapshot]
-        results = await asyncio.gather(*tasks)
-
+        players = [(pid, p) for pid, p in self.players.items() if not p.is_bot]
+        if not players:
+            return
+        results = await asyncio.gather(*[self._send_state(pid, p) for pid, p in players])
         for pid in results:
             if pid is not None:
                 self.remove_player(pid)
@@ -657,10 +689,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = ""):
     player = game.add_player(websocket, name)
 
     if player is None:
-        await websocket.send_text(json_dumps({
-            "t": "full",
-            "msg": "Server full (max 50 players)"
-        }))
+        await websocket.send_text(json_dumps({"t": "full", "msg": "Server full"}))
         await websocket.close()
         return
 
@@ -672,21 +701,18 @@ async def websocket_endpoint(websocket: WebSocket, name: str = ""):
 
     try:
         while True:
-            data = await websocket.receive_text()
-            msg = json_loads(data)
-
-            if msg.get("t") == "m":
+            msg = json_loads(await websocket.receive_text())
+            t = msg.get("t")
+            if t == "m":
                 player.target_x = msg.get("x", player.target_x)
                 player.target_y = msg.get("y", player.target_y)
-            elif msg.get("t") == "w":
+            elif t == "w":
                 game.feed(player)
-            elif msg.get("t") == "s":
+            elif t == "s":
                 game.split(player)
-
     except WebSocketDisconnect:
         game.remove_player(player.id)
-    except Exception as e:
-        print(f"Error: {e}")
+    except:
         game.remove_player(player.id)
 
 

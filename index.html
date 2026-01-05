@@ -94,10 +94,8 @@
     <canvas id="game-canvas"></canvas>
     <div id="score" class="hidden">Score: <span id="score-value">0</span></div>
     <div id="leaderboard" class="hidden">
-        <h3>Leaderboard</h3>
-        <div id="leaderboard-list"></div>
-        <h3 style="margin-top:15px;">Players <span id="player-count"></span></h3>
-        <div id="players-list" style="max-height:200px; overflow-y:auto;"></div>
+        <h3>Leaderboard <span id="player-count" style="color:#888; font-size:0.8em;"></span></h3>
+        <div id="leaderboard-list" style="max-height:300px; overflow-y:auto;"></div>
     </div>
 
     <script>
@@ -118,7 +116,6 @@
         let cactus = [];
         let ejected = [];
         let leaderboardData = [];
-        let allPlayersData = [];
         let mouseX = 0, mouseY = 0;
         let camera = { x: 0, y: 0, scale: 1 };
         let zoomOffset = 0; // Manual zoom adjustment (-0.5 to +0.5)
@@ -181,7 +178,6 @@
                     cactus = (msg.c || []).map(c => ({ x: c[0], y: c[1], size: c[2] }));
                     ejected = (msg.e || []).map(e => ({ x: e[0], y: e[1], size: e[2], color: e[3] }));
                     leaderboardData = msg.l;
-                    allPlayersData = msg.a || [];
                     mapSize = msg.map;  // Update map size (can change dynamically)
                     updateLeaderboard();
                 }
@@ -249,21 +245,8 @@
         }
 
         function updateLeaderboard() {
+            document.getElementById('player-count').textContent = `(${leaderboardData.length})`;
             leaderboardList.innerHTML = leaderboardData.map((p, i) => `<div>${i+1}. ${p[0]}: ${p[1]}</div>`).join('');
-
-            // Update player count and list
-            document.getElementById('player-count').textContent = `(${allPlayersData.length})`;
-            const playersList = document.getElementById('players-list');
-            playersList.innerHTML = allPlayersData.map(p => {
-                // p = [name, total_size, cell_count, is_bot]
-                const name = p[0];
-                const size = p[1];
-                const cells = p[2];
-                const isBot = p[3];
-                const cellInfo = cells > 1 ? ` (${cells} cells)` : '';
-                const botBadge = isBot ? ' <span style="color:#888">[BOT]</span>' : '';
-                return `<div style="color:${isBot ? '#666' : '#fff'}">${name}${cellInfo}${botBadge}</div>`;
-            }).join('');
         }
 
         function gameLoop() {
