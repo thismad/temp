@@ -13,5 +13,8 @@ COPY index.html .
 # Expose port
 EXPOSE 8000
 
+# Production: no bots by default
+ENV NUM_BOTS=0
+
 # Run the application
 CMD ["python", "server.py"]

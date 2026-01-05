@@ -88,7 +88,7 @@
         <input type="text" id="name-input" placeholder="Enter your name" maxlength="15" autofocus>
         <button id="play-btn">PLAY</button>
         <p style="color:#666; margin-top:1.5rem; font-size:0.9rem;">
-            Move: Mouse | Eject mass: Space | Avoid: Cactus
+            Move: Mouse | Split: Space | Feed: W | Avoid: Cactus
         </p>
     </div>
     <canvas id="game-canvas"></canvas>
@@ -178,11 +178,15 @@
 
         canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 
-        // Spacebar to eject mass
+        // W to feed, Space to split
         document.addEventListener('keydown', e => {
-            if (e.code === 'Space' && ws && ws.readyState === WebSocket.OPEN) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            if (e.code === 'KeyW') {
+                ws.send(JSON.stringify({ t: 'w' }));  // Feed
+            } else if (e.code === 'Space') {
                 e.preventDefault();
-                ws.send(JSON.stringify({ t: 'e' }));
+                ws.send(JSON.stringify({ t: 's' }));  // Split
             }
         });
 
@@ -222,13 +226,16 @@
 
         function gameLoop() {
             const players = getInterpolatedPlayers();
-            const me = players.find(p => p.id === myId);
+            // Get all my cells
+            const myCells = players.filter(p => p.id === myId);
 
-            if (me) {
-                camera.x = me.x;
-                camera.y = me.y;
-                camera.scale = Math.max(0.3, 1 - me.size / 500);
-                scoreValue.textContent = Math.floor(me.size * 10);
+            if (myCells.length > 0) {
+                // Camera follows center of all my cells (weighted by size)
+                const totalSize = myCells.reduce((sum, c) => sum + c.size, 0);
+                camera.x = myCells.reduce((sum, c) => sum + c.x * c.size, 0) / totalSize;
+                camera.y = myCells.reduce((sum, c) => sum + c.y * c.size, 0) / totalSize;
+                camera.scale = Math.max(0.2, 1 - totalSize / 300);
+                scoreValue.textContent = Math.floor(totalSize * 10);
             }
 
             render(players);

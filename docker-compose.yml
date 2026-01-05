@@ -4,6 +4,8 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    environment:
+      - NUM_BOTS=0  # Set to 5 for dev mode with bots
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
