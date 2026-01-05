@@ -88,7 +88,7 @@
         <input type="text" id="name-input" placeholder="Enter your name" maxlength="15" autofocus>
         <button id="play-btn">PLAY</button>
         <p style="color:#666; margin-top:1.5rem; font-size:0.9rem;">
-            Move: Mouse | Split: Space | Feed: W | Avoid: Cactus
+            Move: Mouse | Split: Space | Feed: W | Zoom: Scroll | Avoid: Cactus
         </p>
     </div>
     <canvas id="game-canvas"></canvas>
@@ -96,6 +96,8 @@
     <div id="leaderboard" class="hidden">
         <h3>Leaderboard</h3>
         <div id="leaderboard-list"></div>
+        <h3 style="margin-top:15px;">Players <span id="player-count"></span></h3>
+        <div id="players-list" style="max-height:200px; overflow-y:auto;"></div>
     </div>
 
     <script>
@@ -116,8 +118,10 @@
         let cactus = [];
         let ejected = [];
         let leaderboardData = [];
+        let allPlayersData = [];
         let mouseX = 0, mouseY = 0;
         let camera = { x: 0, y: 0, scale: 1 };
+        let zoomOffset = 0; // Manual zoom adjustment (-0.5 to +0.5)
 
         // Interpolation
         let prevPlayers = new Map();
@@ -163,14 +167,21 @@
                 if (msg.t === 's') {
                     prevPlayers = new Map(targetPlayers);
                     targetPlayers.clear();
+                    // Use composite key: playerId_cellIndex to handle multiple cells per player
+                    const cellCountByPlayer = {};
                     msg.p.forEach(p => {
-                        targetPlayers.set(p[0], { id: p[0], x: p[1], y: p[2], size: p[3], name: p[4], color: p[5] });
+                        const playerId = p[0];
+                        const cellIndex = cellCountByPlayer[playerId] || 0;
+                        cellCountByPlayer[playerId] = cellIndex + 1;
+                        const cellKey = `${playerId}_${cellIndex}`;
+                        targetPlayers.set(cellKey, { id: playerId, cellKey, x: p[1], y: p[2], size: p[3], name: p[4], color: p[5] });
                     });
                     lastUpdate = performance.now();
                     food = msg.f.map(f => ({ x: f[0], y: f[1], color: f[2] }));
                     cactus = (msg.c || []).map(c => ({ x: c[0], y: c[1], size: c[2] }));
                     ejected = (msg.e || []).map(e => ({ x: e[0], y: e[1], size: e[2], color: e[3] }));
                     leaderboardData = msg.l;
+                    allPlayersData = msg.a || [];
                     mapSize = msg.map;  // Update map size (can change dynamically)
                     updateLeaderboard();
                 }
@@ -183,6 +194,17 @@
         }
 
         canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+
+        // Scroll to zoom
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const zoomSpeed = 0.05;
+            if (e.deltaY < 0) {
+                zoomOffset = Math.min(0.5, zoomOffset + zoomSpeed); // Zoom in
+            } else {
+                zoomOffset = Math.max(-0.5, zoomOffset - zoomSpeed); // Zoom out
+            }
+        }, { passive: false });
 
         // W to feed, Space to split
         document.addEventListener('keydown', e => {
@@ -210,8 +232,8 @@
             const elapsed = performance.now() - lastUpdate;
             const t = Math.min(elapsed / INTERP_DURATION, 1);
             const result = [];
-            targetPlayers.forEach((target, id) => {
-                const prev = prevPlayers.get(id);
+            targetPlayers.forEach((target, cellKey) => {
+                const prev = prevPlayers.get(cellKey);
                 if (prev) {
                     result.push({
                         ...target,
@@ -228,6 +250,20 @@
 
         function updateLeaderboard() {
             leaderboardList.innerHTML = leaderboardData.map((p, i) => `<div>${i+1}. ${p[0]}: ${p[1]}</div>`).join('');
+
+            // Update player count and list
+            document.getElementById('player-count').textContent = `(${allPlayersData.length})`;
+            const playersList = document.getElementById('players-list');
+            playersList.innerHTML = allPlayersData.map(p => {
+                // p = [name, total_size, cell_count, is_bot]
+                const name = p[0];
+                const size = p[1];
+                const cells = p[2];
+                const isBot = p[3];
+                const cellInfo = cells > 1 ? ` (${cells} cells)` : '';
+                const botBadge = isBot ? ' <span style="color:#888">[BOT]</span>' : '';
+                return `<div style="color:${isBot ? '#666' : '#fff'}">${name}${cellInfo}${botBadge}</div>`;
+            }).join('');
         }
 
         function gameLoop() {
@@ -240,7 +276,8 @@
                 const totalSize = myCells.reduce((sum, c) => sum + c.size, 0);
                 camera.x = myCells.reduce((sum, c) => sum + c.x * c.size, 0) / totalSize;
                 camera.y = myCells.reduce((sum, c) => sum + c.y * c.size, 0) / totalSize;
-                camera.scale = Math.max(0.2, 1 - totalSize / 300);
+                const autoZoom = Math.max(0.2, 1 - totalSize / 300);
+                camera.scale = Math.max(0.1, Math.min(2, autoZoom + zoomOffset));
                 scoreValue.textContent = Math.floor(totalSize * 10);
             }
 

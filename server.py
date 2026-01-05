@@ -599,6 +599,12 @@ class Game:
             if abs(e.x - px) < view_size and abs(e.y - py) < view_size
         ]
 
+        # All connected players list (name, total_size, cell_count, is_bot)
+        all_players = [
+            [p.name, round(p.total_size), len(p.cells), p.is_bot]
+            for p in self.players.values()
+        ]
+
         return {
             "t": "s",
             "p": cells_data,
@@ -606,6 +612,7 @@ class Game:
             "c": cactus_data,
             "e": ejected_data,
             "l": self._cached_leaderboard,
+            "a": all_players,  # All players list
             "you": for_player_id,
             "map": [self.map_width, self.map_height]
         }
