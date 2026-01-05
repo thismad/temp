@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Micro Agar.io</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        #game-canvas { display: block; cursor: crosshair; }
+        #start-screen {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        #start-screen h1 {
+            color: #4ECDC4;
+            font-size: 4rem;
+            margin-bottom: 2rem;
+            text-shadow: 0 0 20px #4ECDC4;
+        }
+        #start-screen input {
+            padding: 1rem 2rem;
+            font-size: 1.5rem;
+            border: none;
+            border-radius: 50px;
+            background: #222;
+            color: #fff;
+            width: 300px;
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+        #start-screen input:focus { outline: 2px solid #4ECDC4; }
+        #start-screen button {
+            padding: 1rem 3rem;
+            font-size: 1.5rem;
+            border: none;
+            border-radius: 50px;
+            background: #4ECDC4;
+            color: #111;
+            cursor: pointer;
+            font-weight: bold;
+            transition: transform 0.2s;
+        }
+        #start-screen button:hover { transform: scale(1.05); }
+        #leaderboard {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 15px;
+            border-radius: 10px;
+            color: #fff;
+            min-width: 150px;
+        }
+        #leaderboard h3 {
+            margin-bottom: 10px;
+            color: #4ECDC4;
+            border-bottom: 1px solid #333;
+            padding-bottom: 5px;
+        }
+        #leaderboard div { padding: 3px 0; font-size: 0.9rem; }
+        #score {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 15px 25px;
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1.2rem;
+        }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <div id="start-screen">
+        <h1>Micro Agar</h1>
+        <input type="text" id="name-input" placeholder="Enter your name" maxlength="15" autofocus>
+        <button id="play-btn">PLAY</button>
+        <p style="color:#666; margin-top:1.5rem; font-size:0.9rem;">
+            Move: Mouse | Eject mass: Space | Avoid: Cactus
+        </p>
+    </div>
+    <canvas id="game-canvas"></canvas>
+    <div id="score" class="hidden">Score: <span id="score-value">0</span></div>
+    <div id="leaderboard" class="hidden">
+        <h3>Leaderboard</h3>
+        <div id="leaderboard-list"></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const startScreen = document.getElementById('start-screen');
+        const nameInput = document.getElementById('name-input');
+        const playBtn = document.getElementById('play-btn');
+        const scoreEl = document.getElementById('score');
+        const scoreValue = document.getElementById('score-value');
+        const leaderboardEl = document.getElementById('leaderboard');
+        const leaderboardList = document.getElementById('leaderboard-list');
+
+        let ws = null;
+        let myId = null;
+        let mapSize = [2000, 2000];
+        let food = [];
+        let cactus = [];
+        let ejected = [];
+        let leaderboardData = [];
+        let mouseX = 0, mouseY = 0;
+        let camera = { x: 0, y: 0, scale: 1 };
+
+        // Interpolation
+        let prevPlayers = new Map();
+        let targetPlayers = new Map();
+        let lastUpdate = 0;
+        const INTERP_DURATION = 50;
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        playBtn.addEventListener('click', startGame);
+        nameInput.addEventListener('keypress', e => { if (e.key === 'Enter') startGame(); });
+
+        function startGame() {
+            const name = nameInput.value.trim() || 'Player';
+            startScreen.classList.add('hidden');
+            scoreEl.classList.remove('hidden');
+            leaderboardEl.classList.remove('hidden');
+            connect(name);
+        }
+
+        function connect(name) {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws?name=${encodeURIComponent(name)}`);
+
+            ws.onopen = () => console.log('Connected!');
+            ws.onmessage = e => {
+                const msg = JSON.parse(e.data);
+                if (msg.t === 'welcome') {
+                    myId = msg.id;
+                    mapSize = msg.map;
+                    requestAnimationFrame(gameLoop);
+                }
+                if (msg.t === 's') {
+                    prevPlayers = new Map(targetPlayers);
+                    targetPlayers.clear();
+                    msg.p.forEach(p => {
+                        targetPlayers.set(p[0], { id: p[0], x: p[1], y: p[2], size: p[3], name: p[4], color: p[5] });
+                    });
+                    lastUpdate = performance.now();
+                    food = msg.f.map(f => ({ x: f[0], y: f[1], color: f[2] }));
+                    cactus = (msg.c || []).map(c => ({ x: c[0], y: c[1], size: c[2] }));
+                    ejected = (msg.e || []).map(e => ({ x: e[0], y: e[1], size: e[2], color: e[3] }));
+                    leaderboardData = msg.l;
+                    updateLeaderboard();
+                }
+            };
+            ws.onclose = () => {
+                startScreen.classList.remove('hidden');
+                scoreEl.classList.add('hidden');
+                leaderboardEl.classList.add('hidden');
+            };
+        }
+
+        canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+
+        // Spacebar to eject mass
+        document.addEventListener('keydown', e => {
+            if (e.code === 'Space' && ws && ws.readyState === WebSocket.OPEN) {
+                e.preventDefault();
+                ws.send(JSON.stringify({ t: 'e' }));
+            }
+        });
+
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN && myId) {
+                const worldX = (mouseX - canvas.width/2) / camera.scale + camera.x;
+                const worldY = (mouseY - canvas.height/2) / camera.scale + camera.y;
+                ws.send(JSON.stringify({ t: 'm', x: worldX, y: worldY }));
+            }
+        }, 50);
+
+        function lerp(a, b, t) { return a + (b - a) * t; }
+
+        function getInterpolatedPlayers() {
+            const elapsed = performance.now() - lastUpdate;
+            const t = Math.min(elapsed / INTERP_DURATION, 1);
+            const result = [];
+            targetPlayers.forEach((target, id) => {
+                const prev = prevPlayers.get(id);
+                if (prev) {
+                    result.push({
+                        ...target,
+                        x: lerp(prev.x, target.x, t),
+                        y: lerp(prev.y, target.y, t),
+                        size: lerp(prev.size, target.size, t)
+                    });
+                } else {
+                    result.push(target);
+                }
+            });
+            return result;
+        }
+
+        function updateLeaderboard() {
+            leaderboardList.innerHTML = leaderboardData.map((p, i) => `<div>${i+1}. ${p[0]}: ${p[1]}</div>`).join('');
+        }
+
+        function gameLoop() {
+            const players = getInterpolatedPlayers();
+            const me = players.find(p => p.id === myId);
+
+            if (me) {
+                camera.x = me.x;
+                camera.y = me.y;
+                camera.scale = Math.max(0.3, 1 - me.size / 500);
+                scoreValue.textContent = Math.floor(me.size * 10);
+            }
+
+            render(players);
+            requestAnimationFrame(gameLoop);
+        }
+
+        function render(players) {
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(canvas.width/2, canvas.height/2);
+            ctx.scale(camera.scale, camera.scale);
+            ctx.translate(-camera.x, -camera.y);
+
+            // Grid
+            ctx.strokeStyle = '#1a1a1a';
+            ctx.lineWidth = 1;
+            for (let x = 0; x <= mapSize[0]; x += 50) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, mapSize[1]); ctx.stroke();
+            }
+            for (let y = 0; y <= mapSize[1]; y += 50) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(mapSize[0], y); ctx.stroke();
+            }
+
+            // Border
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 5;
+            ctx.strokeRect(0, 0, mapSize[0], mapSize[1]);
+
+            // Food
+            food.forEach(f => {
+                ctx.beginPath();
+                ctx.arc(f.x, f.y, 8, 0, Math.PI * 2);
+                ctx.fillStyle = f.color;
+                ctx.fill();
+            });
+
+            // Ejected mass
+            ejected.forEach(e => {
+                ctx.beginPath();
+                ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
+                ctx.fillStyle = e.color;
+                ctx.fill();
+                ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            });
+
+            // Cactus (spiky green circles)
+            cactus.forEach(c => {
+                // Draw spikes
+                const spikes = 8;
+                ctx.beginPath();
+                for (let i = 0; i < spikes * 2; i++) {
+                    const angle = (i * Math.PI) / spikes;
+                    const r = i % 2 === 0 ? c.size * 1.4 : c.size * 0.8;
+                    const px = c.x + Math.cos(angle) * r;
+                    const py = c.y + Math.sin(angle) * r;
+                    if (i === 0) ctx.moveTo(px, py);
+                    else ctx.lineTo(px, py);
+                }
+                ctx.closePath();
+                ctx.fillStyle = '#2d5a27';
+                ctx.fill();
+                ctx.strokeStyle = '#1a3a17';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            });
+
+            // Players
+            [...players].sort((a, b) => b.size - a.size).forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                ctx.fillStyle = p.color;
+                ctx.fill();
+                ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+                ctx.fillStyle = '#fff';
+                ctx.font = `bold ${Math.max(12, p.size/3)}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(p.name, p.x, p.y);
+            });
+
+            ctx.restore();
+        }
+    </script>
+</body>
+</html>
