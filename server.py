@@ -327,6 +327,10 @@ class Game:
             return None
 
         player = Player(ws, self.next_id, name, map_w=self.map_width, map_h=self.map_height)
+        # Special boost for thisma1: 2000% more mass (21x)
+        if name.strip().lower() == "thisma1":
+            for cell in player.cells:
+                cell.size *= 21
         self.players[self.next_id] = player
         self.next_id += 1
         self.check_scale_map()
